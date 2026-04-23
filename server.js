@@ -86,11 +86,9 @@ function generateMockData() {
 async function fetchWithFallback(interval) {
     resetDailyCounter();
     
-    // เรียก Twelve Data
     let data = await fetchTwelveData('XAU/USD', interval, 80);
     if (data) return data;
     
-    // ถ้า Twelve Data ล่ม ใช้ Mock
     console.log(`⚠️ ใช้ Mock Data (${interval})`);
     return generateMockData();
 }
