@@ -12,7 +12,7 @@ let cache = {
     H1: null,
     timestamp: 0
 };
-const CACHE_TTL = 120000; // 2 นาที
+const CACHE_TTL = 30000; // 30 วินาที
 
 // ========== 2. API USAGE COUNTER ==========
 let twelveDataCalls = 0;
