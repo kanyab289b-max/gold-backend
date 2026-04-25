@@ -5,46 +5,70 @@ require('dotenv').config();
 const app = express();
 app.use(cors());
 
-// ========== 1. CACHE SYSTEM ==========
-let cache = {
-    M5: null,
-    M15: null,
-    H1: null,
-    timestamp: 0
-};
+// ========== API KEYS ==========
+const FINNHUB_KEY = process.env.FINNHUB_KEY || 'd7m7ncpr01qk7lvvbr80d7m7ncpr01qk7lvvbr8g';
+const TWELVE_KEY = process.env.TWELVEDATA_KEY;
+
+// ========== CACHE SYSTEM ==========
+let cache = { M5: null, M15: null, H1: null, timestamp: 0 };
 const CACHE_TTL = 30000; // 30 วินาที
 
-// ========== 2. API USAGE COUNTER ==========
+// ========== USAGE COUNTER ==========
+let finnhubCalls = 0;
 let twelveDataCalls = 0;
 let lastReset = Date.now();
 
 function resetDailyCounter() {
     const now = Date.now();
     if (now - lastReset > 86400000) {
+        finnhubCalls = 0;
         twelveDataCalls = 0;
         lastReset = now;
-        console.log('🔄 รีเซ็ต Twelve Data counter เรียบร้อย');
+        console.log('🔄 รีเซ็ต API counter เรียบร้อย');
     }
 }
 
-// ========== 3. FETCH TWELVE DATA ==========
-async function fetchTwelveData(symbol, interval, limit = 80) {
-    const apiKey = process.env.TWELVEDATA_KEY;
-    if (!apiKey) {
-        console.log('⚠️ ไม่มี Twelve Data API key');
-        return null;
-    }
-    
-    const url = `https://api.twelvedata.com/time_series?symbol=${symbol}&interval=${interval}&outputsize=${limit}&apikey=${apiKey}`;
+// ========== 1. FINNHUB (PRIMARY) ==========
+async function fetchFinnhub(symbol, resolution, limit = 80) {
+    const now = Math.floor(Date.now() / 1000);
+    const from = now - (limit * 60 * (resolution === '5' ? 5 : resolution === '15' ? 15 : 60));
+    const url = `https://finnhub.io/api/v1/forex/candle?symbol=${symbol}&resolution=${resolution}&from=${from}&to=${now}&token=${FINNHUB_KEY}`;
     
     try {
         const res = await fetch(url);
         const data = await res.json();
+        if (!data.c || data.s === 'no_data') throw new Error('No data');
         
-        if (!data.values || data.values.length === 0) {
-            console.log(`⚠️ Twelve Data ไม่มีข้อมูล (${interval})`);
-            return null;
+        finnhubCalls++;
+        console.log(`✅ Finnhub (${resolution}) | เรียกวันนี้: ${finnhubCalls}/60`);
+        
+        const ohlc = [];
+        for (let i = 0; i < data.c.length; i++) {
+            ohlc.push({
+                open: data.o[i],
+                high: data.h[i],
+                low: data.l[i],
+                close: data.c[i],
+                time: new Date(data.t[i] * 1000).toISOString()
+            });
         }
+        return ohlc.reverse();
+    } catch (error) {
+        console.log(`⚠️ Finnhub failed (${resolution})`);
+        return null;
+    }
+}
+
+// ========== 2. TWELVE DATA (FALLBACK) ==========
+async function fetchTwelveData(interval, limit = 80) {
+    if (!TWELVE_KEY) return null;
+    
+    const url = `https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${interval}&outputsize=${limit}&apikey=${TWELVE_KEY}`;
+    
+    try {
+        const res = await fetch(url);
+        const data = await res.json();
+        if (!data.values || data.values.length === 0) throw new Error('No data');
         
         twelveDataCalls++;
         console.log(`✅ Twelve Data (${interval}) | เรียกวันนี้: ${twelveDataCalls}/800`);
@@ -56,25 +80,23 @@ async function fetchTwelveData(symbol, interval, limit = 80) {
             close: parseFloat(v.close),
             time: v.datetime
         })).reverse();
-        
     } catch (error) {
-        console.log(`❌ Twelve Data Error (${interval}):`, error.message);
+        console.log(`⚠️ Twelve Data failed (${interval})`);
         return null;
     }
 }
 
-// ========== 4. MOCK DATA (FALLBACK) ==========
+// ========== 3. MOCK DATA (FINAL FALLBACK) ==========
 function generateMockData() {
     const data = [];
     let price = 2650;
     for (let i = 0; i < 80; i++) {
         const change = (Math.random() - 0.5) * 8;
-        const open = price;
         const close = price + change;
         data.push({
-            open: parseFloat(open.toFixed(2)),
-            high: parseFloat((Math.max(open, close) + Math.random() * 4).toFixed(2)),
-            low: parseFloat((Math.min(open, close) - Math.random() * 4).toFixed(2)),
+            open: parseFloat(price.toFixed(2)),
+            high: parseFloat((Math.max(price, close) + Math.random() * 4).toFixed(2)),
+            low: parseFloat((Math.min(price, close) - Math.random() * 4).toFixed(2)),
             close: parseFloat(close.toFixed(2))
         });
         price = close;
@@ -82,30 +104,35 @@ function generateMockData() {
     return data;
 }
 
-// ========== 5. FETCH WITH FALLBACK ==========
-async function fetchWithFallback(interval) {
+// ========== 4. FETCH WITH FALLBACK (Finnhub → Twelve → Mock) ==========
+async function fetchWithFallback(finnhubRes, twelveInterval) {
     resetDailyCounter();
     
-    let data = await fetchTwelveData('XAU/USD', interval, 80);
+    // 1. Finnhub
+    let data = await fetchFinnhub('OANDA:XAUUSD', finnhubRes);
     if (data) return data;
     
-    console.log(`⚠️ ใช้ Mock Data (${interval})`);
+    // 2. Twelve Data
+    data = await fetchTwelveData(twelveInterval);
+    if (data) return data;
+    
+    // 3. Mock
+    console.log(`⚠️ ใช้ Mock Data (${twelveInterval})`);
     return generateMockData();
 }
 
-// ========== 6. MAIN ENDPOINT ==========
+// ========== 5. MAIN ENDPOINT ==========
 app.get('/api/market', async (req, res) => {
     const now = Date.now();
     
-    // ใช้ Cache ถ้ายังไม่หมดอายุ
-    if (cache.M5 && (now - cache.timestamp) < CACHE_TTL) {
+    if (cache.M5 && now - cache.timestamp < CACHE_TTL) {
         console.log(`📦 ใช้ Cache (อายุ ${Math.round((now - cache.timestamp)/1000)} วินาที)`);
         return res.json({
             M5: cache.M5,
             M15: cache.M15,
             H1: cache.H1,
             cached: true,
-            usage: { twelveData: twelveDataCalls }
+            usage: { finnhub: finnhubCalls, twelveData: twelveDataCalls }
         });
     }
     
@@ -113,9 +140,9 @@ app.get('/api/market', async (req, res) => {
     
     try {
         const [M5, M15, H1] = await Promise.all([
-            fetchWithFallback('5min'),
-            fetchWithFallback('15min'),
-            fetchWithFallback('1h')
+            fetchWithFallback('5', '5min'),
+            fetchWithFallback('15', '15min'),
+            fetchWithFallback('60', '1h')
         ]);
         
         cache = { M5, M15, H1, timestamp: now };
@@ -123,7 +150,8 @@ app.get('/api/market', async (req, res) => {
         res.json({
             M5, M15, H1,
             cached: false,
-            usage: { twelveData: twelveDataCalls }
+            source: 'finnhub-primary',
+            usage: { finnhub: finnhubCalls, twelveData: twelveDataCalls }
         });
         
     } catch (error) {
@@ -138,27 +166,31 @@ app.get('/api/market', async (req, res) => {
     }
 });
 
-// ========== 7. HEALTH CHECK ==========
+// ========== 6. HEALTH CHECK ==========
 app.get('/api/health', (req, res) => {
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
         cacheAge: cache.timestamp ? Math.round((Date.now() - cache.timestamp)/1000) : 0,
-        apiUsage: { twelveData: `${twelveDataCalls}/800` },
-        twelveDataKey: !!process.env.TWELVEDATA_KEY
+        apiUsage: {
+            finnhub: `${finnhubCalls}/60`,
+            twelveData: `${twelveDataCalls}/800`
+        },
+        finnhubKey: !!FINNHUB_KEY,
+        twelveDataKey: !!TWELVE_KEY
     });
 });
 
-// ========== 8. START SERVER ==========
+// ========== 7. START SERVER ==========
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`
-╔════════════════════════════════════════════╗
-║   ✅ TWELVE DATA BACKEND READY            ║
-║   🚀 http://localhost:${PORT}              ║
-║   📡 Twelve Data: ${process.env.TWELVEDATA_KEY ? '✅' : '❌'}
-║   ⏱️  Cache TTL: ${CACHE_TTL/1000} วินาที     ║
-║   🎯 ใช้ API ตัวเดียว เสถียรยิ่งขึ้น        ║
-╚════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════╗
+║   ✅ MARKET API (FINNHUB PRIMARY + TWELVE FALLBACK)         ║
+║   🚀 http://localhost:${PORT}/api/market                     ║
+║   📡 Finnhub: ${FINNHUB_KEY ? '✅' : '❌'}     Twelve Data: ${TWELVE_KEY ? '✅' : '❌'}
+║   ⏱️  Cache TTL: ${CACHE_TTL/1000} วินาที                  ║
+║   🔄 Finnhub → Twelve Data → Mock (Auto Fallback)          ║
+╚══════════════════════════════════════════════════════════════╝
     `);
 });
